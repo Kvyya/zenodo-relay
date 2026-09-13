@@ -31,12 +31,30 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "===== 1. 拉取 Zenodo 记录元数据 ====="
-          curl -sS --retry 5 "https://zenodo.org/api/records/$REC" -o meta.json
-          jq -r '.files[] | [.key, .size, .links.self] | @tsv' meta.json > files.txt
-          echo "记录包含以下文件:"
-          cat files.txt
+          echo "===== 0. 环境诊断 ====="
+          echo "代理相关环境变量:"; env | grep -i proxy || echo "(无)"
+          echo "curl 版本:"; curl --version | head -1
+          echo "gh 版本:"; gh --version | head -1
+          echo "jq 版本:"; jq --version
           df -h .
+
+          echo "===== 1. 拉取 Zenodo 记录元数据 ====="
+          http_code=$(curl -sS -w '%{http_code}' --retry 5 --connect-timeout 30 -o meta.json "https://zenodo.org/api/records/$REC" || echo CURL_FAIL_$?)
+          echo "HTTP 状态码: $http_code"
+          if [ "$http_code" != "200" ]; then
+            echo "元数据获取失败,返回内容前 500 字节:"
+            head -c 500 meta.json || true
+            exit 1
+          fi
+          head -c 300 meta.json; echo
+
+          jq -r '.files[]? | [.key, .size, .links.self] | @tsv' meta.json > files.txt || { echo "解析 files 失败"; exit 1; }
+          echo "记录包含以下文件(key <TAB> size <TAB> url):"
+          cat files.txt
+          if [ ! -s files.txt ]; then
+            echo "记录中没有文件,元数据里的 keys:"; jq -r 'keys[]' meta.json
+            exit 1
+          fi
 
           echo "===== 2. 按子串过滤(可选)====="
           if [ -n "$INCLUDE" ]; then
@@ -49,7 +67,7 @@ jobs:
             done < files.txt
             mv filtered.txt files.txt
           fi
-          [ -s files.txt ] || { echo "没有匹配的文件,退出"; exit 1; }
+          [ -s files.txt ] || { echo "过滤后没有匹配的文件,退出"; exit 1; }
           echo "实际处理:"
           cat files.txt
 
@@ -60,7 +78,7 @@ jobs:
           while IFS=$'\t' read -r key size url; do
             echo "----- 处理: $key (大小 $size 字节) -----"
 
-            # 3.1 下载(断点续传 + 无限重试,每卷最多 30 次)
+            # 3.1 下载(断点续传 + 重试)
             rm -f "$key"
             ok=no
             for i in $(seq 1 30); do
@@ -70,7 +88,7 @@ jobs:
               echo "下载中断,10 秒后第 $i 次重试..."
               sleep 10
             done
-            [ "$ok" = yes ] || { echo "下载失败: $key"; exit 1; }
+            if [ "$ok" != yes ]; then echo "下载失败: $key"; exit 1; fi
 
             # 3.2 校验文件大小
             actual=$(stat -c%s "$key")
