@@ -39,7 +39,7 @@ jobs:
           df -h .
 
           echo "===== 1. 拉取 Zenodo 记录元数据 ====="
-          http_code=$(curl -sS -w '%{http_code}' --retry 5 --connect-timeout 30 -o meta.json "https://zenodo.org/api/records/$REC" || echo CURL_FAIL_$?)
+          http_code=$(curl -sSL -w '%{http_code}' --retry 5 --connect-timeout 30 -o meta.json "https://zenodo.org/api/records/$REC" || echo CURL_FAIL_$?)
           echo "HTTP 状态码: $http_code"
           if [ "$http_code" != "200" ]; then
             echo "元数据获取失败,返回内容前 500 字节:"
