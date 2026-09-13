@@ -1,0 +1,109 @@
+name: zenodo-relay
+
+# 手动触发:从 Zenodo 下载文件,切成 1.9GB 分卷,挂到 GitHub Release
+# 国内用户再通过 ghproxy 镜像站从 Release 拉回分卷,本地合并还原
+on:
+  workflow_dispatch:
+    inputs:
+      record_id:
+        description: "Zenodo record ID(数字部分),如 15738313"
+        required: true
+      include:
+        description: "可选:只处理文件名含这些子串的文件,逗号分隔;留空=全部"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Relay files from Zenodo to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          REC: ${{ inputs.record_id }}
+          INCLUDE: ${{ inputs.include }}
+          TAG: relay-${{ inputs.record_id }}-${{ github.run_number }}
+        run: |
+          set -euo pipefail
+
+          echo "===== 1. 拉取 Zenodo 记录元数据 ====="
+          curl -sS --retry 5 "https://zenodo.org/api/records/$REC" -o meta.json
+          jq -r '.files[] | [.key, .size, .links.self] | @tsv' meta.json > files.txt
+          echo "记录包含以下文件:"
+          cat files.txt
+          df -h .
+
+          echo "===== 2. 按子串过滤(可选)====="
+          if [ -n "$INCLUDE" ]; then
+            IFS=',' read -ra pats <<< "$INCLUDE"
+            : > filtered.txt
+            while IFS=$'\t' read -r k s u; do
+              for p in "${pats[@]}"; do
+                case "$k" in *"$p"*) printf '%s\t%s\t%s\n' "$k" "$s" "$u" >> filtered.txt; break;; esac
+              done
+            done < files.txt
+            mv filtered.txt files.txt
+          fi
+          [ -s files.txt ] || { echo "没有匹配的文件,退出"; exit 1; }
+          echo "实际处理:"
+          cat files.txt
+
+          : > checksums.txt
+          CREATED=no
+
+          echo "===== 3. 逐文件下载 -> 校验 -> 分卷 -> 上传 ====="
+          while IFS=$'\t' read -r key size url; do
+            echo "----- 处理: $key (大小 $size 字节) -----"
+
+            # 3.1 下载(断点续传 + 无限重试,每卷最多 30 次)
+            rm -f "$key"
+            ok=no
+            for i in $(seq 1 30); do
+              if curl -sSL -C - --retry 10 --retry-all-errors --connect-timeout 30 -o "$key" "$url"; then
+                ok=yes; break
+              fi
+              echo "下载中断,10 秒后第 $i 次重试..."
+              sleep 10
+            done
+            [ "$ok" = yes ] || { echo "下载失败: $key"; exit 1; }
+
+            # 3.2 校验文件大小
+            actual=$(stat -c%s "$key")
+            if [ "$actual" != "$size" ]; then
+              echo "大小不符: 实际 $actual, 期望 $size"; exit 1
+            fi
+
+            # 3.3 记录 SHA256(用户本地合并后校验用)
+            sha256sum "$key" >> checksums.txt
+
+            # 3.4 切成 1.9GB 分卷(GitHub Release 单文件上限 2GB)
+            rm -f "$key".part-*
+            split -b 1900m -d -a 3 "$key" "$key.part-"
+            rm -f "$key"
+            echo "分卷完成: $(ls "$key".part-* | wc -l) 卷"
+
+            # 3.5 创建 Release(整个任务只建一次)
+            if [ "$CREATED" = no ]; then
+              gh release create "$TAG" --repo "$REPO" \
+                --title "Zenodo record $REC relay" \
+                --notes "镜像自 https://doi.org/10.5281/zenodo.$REC ,仅学术研究用途,用后请删除。"
+              CREATED=yes
+            fi
+
+            # 3.6 上传分卷
+            gh release upload "$TAG" --repo "$REPO" "$key".part-* --clobber
+            rm -f "$key".part-*
+            echo "已上传 $key,剩余磁盘:"
+            df -h .
+          done < files.txt
+
+          echo "===== 4. 上传校验清单 ====="
+          gh release upload "$TAG" --repo "$REPO" checksums.txt --clobber
+          echo "全部完成! Release tag = $TAG"
+          echo "----- checksums.txt -----"
+          cat checksums.txt
